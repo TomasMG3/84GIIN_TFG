@@ -1,0 +1,70 @@
+{
+    "zones": [
+        {
+            "name": "El Golf",
+            "bounds": {
+                "north": -33.4000,
+                "south": -33.4100,
+                "east": -70.5150,
+                "west": -70.5300
+            },
+            "waste_generation_rate": "high",
+            "description": "Barrio financiero y residencial exclusivo, centro de oficinas y servicios."
+        },
+        {
+            "name": "Sanhattan",
+            "bounds": {
+                "north": -33.4055,
+                "south": -33.4150,
+                "east": -70.5100,
+                "west": -70.5300
+            },
+            "waste_generation_rate": "high",
+            "description": "Distrito financiero de alto estándar con gran flujo de gente laboral."
+        },
+        {
+            "name": "Apoquindo",
+            "bounds": {
+                "north": -33.4100,
+                "south": -33.4200,
+                "east": -70.5000,
+                "west": -70.5350
+            },
+            "waste_generation_rate": "medium",
+            "description": "Eje comercial y residencial con buena conectividad Metro Línea 1."
+        },
+        {
+            "name": "Nueva Las Condes",
+            "bounds": {
+                "north": -33.3950,
+                "south": -33.4050,
+                "east": -70.4950,
+                "west": -70.5200
+            },
+            "waste_generation_rate": "medium",
+            "description": "Zona residencial reciente, cerca de Parque Araucano y establecimientos familiares."
+        },
+        {
+            "name": "San Carlos de Apoquindo",
+            "bounds": {
+                "north": -33.3850,
+                "south": -33.3950,
+                "east": -70.4900,
+                "west": -70.5150
+            },
+            "waste_generation_rate": "low",
+            "description": "Sector residencial con mayor contacto a natura­leza, ideal para familias."
+        },
+        {
+            "name": "Parque Araucano",
+            "bounds": {
+                "north": -33.4030,
+                "south": -33.4080,
+                "east": -70.5050,
+                "west": -70.5150
+            },
+            "waste_generation_rate": "medium",
+            "description": "Área verde grande con uso recreativo, shopping y eventos."
+        }
+    ]
+}
