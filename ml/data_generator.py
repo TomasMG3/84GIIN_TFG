@@ -15,6 +15,19 @@ class LasCondesDataGenerator:
             "lon_max": -70.4851
         }
         
+        self.container_capacities = {
+            'small': 240,   # Contenedores pequeños
+            'medium': 340,  # Contenedores medianos  
+            'large': 660    # Contenedores grandes
+        }
+        
+        self.zone_container_distribution = {
+            "CENTRO": {'small': 0.2, 'medium': 0.5, 'large': 0.3},
+            "VITACURA_LIMITE": {'small': 0.1, 'medium': 0.4, 'large': 0.5},
+            "KENNEDY": {'small': 0.3, 'medium': 0.5, 'large': 0.2},
+            # ... otras zonas
+        }
+        
         # Zonas de Las Condes con diferentes densidades
         self.zones = {
             "CENTRO": {"lat": -33.4119, "lon": -70.5241, "density": 0.8},
@@ -55,8 +68,15 @@ class LasCondesDataGenerator:
                 p=[0.5, 0.3, 0.2]
             )
             
-            # Capacidad típica de contenedores
-            capacity = np.random.choice([800, 1000, 1200], p=[0.3, 0.5, 0.2])
+            zone_dist = self.zone_container_distribution.get(zone_name, {'small': 0.33, 'medium': 0.33, 'large': 0.34})
+            container_type = np.random.choice(
+                list(zone_dist.keys()), 
+                p=list(zone_dist.values())
+            )
+            capacity = self.container_capacities[container_type]
+            
+            current_level = np.random.uniform(0, capacity * 0.3)
+            fill_percentage = (current_level / capacity) * 100
             
             containers.append({
                 "container_id": f"LC-{i+1:04d}",
@@ -65,6 +85,9 @@ class LasCondesDataGenerator:
                 "zone": zone_name,
                 "area_type": area_type,
                 "capacity": capacity,
+                "container_type": container_type,
+                "current_level": round(current_level, 2),
+                "fill_percentage": round(fill_percentage, 2),
                 "address": f"Calle {i+1}, Las Condes",
                 "installation_date": datetime.now() - timedelta(days=np.random.randint(30, 365))
             })
@@ -118,7 +141,7 @@ class LasCondesDataGenerator:
                         "container_id": container["container_id"],
                         "timestamp": timestamp,
                         "fill_percentage": round(current_fill, 2),
-                        "fill_level": round((current_fill / 100) * container["capacity"], 2),
+                        "fill_level": round((current_fill / 1000) * container["capacity"], 2),     # Revisar Porcentaje de llenado
                         "temperature": round(temperature, 1),
                         "battery_level": round(battery_level, 1),
                         "zone": container["zone"],

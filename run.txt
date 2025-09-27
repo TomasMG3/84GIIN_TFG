@@ -1,0 +1,22 @@
+python -m venv venv
+
+venv\Scripts\activate
+
+pip install -r requirements.txt
+
+
+uvicorn app.main:app --reload --port 8000
+streamlit run dashboard/streamlit_app.py
+
+
+
+
+
+5b3ce3597851110001cf6248ec92228b5c8548f2a2ef9b6c0
+5322733
+
+34 camiones
+
+4 personas cada flota
+
+650 por cada persona

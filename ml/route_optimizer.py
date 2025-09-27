@@ -5,10 +5,14 @@ import json
 import math
 import random
 import numpy as np
+import pandas as pd
 from typing import List, Dict, Optional, Tuple
 import os
 from dataclasses import dataclass
 from datetime import datetime
+import openrouteservice
+from openrouteservice import convert
+import polyline
 
 @dataclass
 class Container:
@@ -36,8 +40,8 @@ class RouteOptimizer:
             print("Warning: OpenRouteService API key is not configured. Using fallback methods.")
         
         self.base_url = "https://api.openrouteservice.org"
-        self.depot_lat = -33.4119
-        self.depot_lon = -70.5241
+        self.depot_lat = -33.4166986
+        self.depot_lon = -70.5179074
         self.max_locations = 50  # Límite de OpenRouteService gratuito
         
     def calculate_distance(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -127,55 +131,36 @@ class RouteOptimizer:
             return None
     
     def get_route_geometry(self, containers: List[Container], route_order: List[int]) -> Optional[List[List[float]]]:
-        """Obtiene geometría de ruta usando OpenRouteService Directions API"""
-        
-        if not self.api_key:
-            return None
-        
-        # Construir coordenadas en orden de visita
-        coordinates = [[self.depot_lon, self.depot_lat]]  # Depot
-        
-        for container_idx in route_order:
-            container = containers[container_idx - 1]  # -1 porque índices empiezan en 1
-            coordinates.append([container.lon, container.lat])
-        
-        coordinates.append([self.depot_lon, self.depot_lat])  # Regreso al depot
-        
-        url = f"{self.base_url}/v2/directions/driving-car"
-        
+        # 1) Construye lista de coordenadas con depósito al inicio y al final
+        coords = [[self.depot_lon, self.depot_lat]]  # depot como [lon, lat]
+        for idx in route_order:
+            c = containers[idx]
+            coords.append([c.lon, c.lat])
+        coords.append([self.depot_lon, self.depot_lat])  # regreso al depot
+
+        # 2) Llama a ORS pidiendo geojson directamente
+        url = "https://api.openrouteservice.org/v2/directions/driving-car/geojson"
         headers = {
-            'Accept': 'application/json',
-            'Authorization': self.api_key,
-            'Content-Type': 'application/json; charset=utf-8'
+            "Authorization": "5b3ce3597851110001cf6248ec92228b5c8548f2a2ef9b6c05322733",
+            "Content-Type": "application/json"
         }
-        
         body = {
-            "coordinates": coordinates,
-            "format": "geojson"
+            "coordinates": coords,
+            "geometry": True,
+            "instructions": False,
         }
-        
+
         try:
-            response = requests.post(url, json=body, headers=headers, timeout=15)
-            
-            if response.status_code == 200:
-                data = response.json()
-                if 'features' in data and len(data['features']) > 0:
-                    geometry = data['features'][0]['geometry']
-                    if geometry['type'] == 'LineString':
-                        return geometry['coordinates']
-                    else:
-                        print(f"Geometría inesperada: {geometry['type']}")
-                        return None
-                else:
-                    print(f"No se encontraron features en respuesta: {data}")
-                    return None
-            else:
-                print(f"Error OpenRouteService Directions: {response.status_code} - {response.text}")
-                return None
-                
-        except requests.exceptions.RequestException as e:
-            print(f"Error de conexión con OpenRouteService Directions: {e}")
-            return None
+            resp = requests.post(url, json=body, headers=headers, timeout=15)
+            resp.raise_for_status()
+            feat = resp.json()["features"][0]["geometry"]
+            if feat["type"] == "LineString":
+                # devuelve lista de [lon, lat] ya en el orden que espera tu map
+                return feat["coordinates"]
+        except Exception as e:
+            print("Error al obtener geometría ORS:", e)
+        return None
+
     
     def optimize_route(self, containers: List[Container]) -> Dict:
         """Optimiza ruta usando OpenRouteService con fallback a Haversine"""
@@ -199,10 +184,12 @@ class RouteOptimizer:
         total_distance = self._calculate_route_distance_from_matrix(route_order, distance_matrix)
         optimization_method = "openrouteservice_matrix"
         
-        # Obtener geometría de ruta real
-        route_geometry = None
-        if distance_matrix:  # Solo si OpenRouteService está funcionando
+        if len(containers) + 2 <= self.max_locations:  # +2 for depot start/end
             route_geometry = self.get_route_geometry(containers, route_order)
+        else:
+            print(f"Too many locations ({len(containers)}), skipping detailed geometry")
+            route_geometry = None
+
         
         # Construir respuesta
         route_containers = []
@@ -231,7 +218,7 @@ class RouteOptimizer:
             })
         
         # Estimaciones
-        estimated_time = int(total_distance * 2.5 + len(route_containers) * 5)
+        estimated_time = int(total_distance * 2.5 + len(route_containers))
         fuel_consumption = total_distance * 0.35
         co2_emissions = fuel_consumption * 2.6
         
@@ -364,7 +351,7 @@ class RouteOptimizer:
         return matrix
     
     def _initialize_population(self, containers: List[Container], vehicles: List[Vehicle], 
-                             population_size: int) -> List[List[List[int]]]:
+                            population_size: int) -> List[List[List[int]]]:
         """Inicializa población para algoritmo genético"""
         population = []
         container_indices = list(range(1, len(containers) + 1))  # 1-indexed
@@ -525,35 +512,23 @@ class RouteOptimizer:
             "optimization_method": "genetic_algorithm_openrouteservice"
         }
     
-    def _nearest_neighbor_with_matrix(self, containers: List[Container], 
-                                    distance_matrix: List[List[float]]) -> List[int]:
-        """Algoritmo nearest neighbor usando matriz de distancias real"""
+    def _nearest_neighbor_with_matrix(self, containers, distance_matrix):
         n = len(containers)
-        unvisited = list(range(1, n + 1))  # Índices 1 a n (0 es depot)
-        route = []
-        current_pos = 0  # Empezar en depot
-        
+        unvisited = list(range(n))  # 0-based indices
+        route_order = []
+        current_pos = 0  # empezamos en el depósito
+
         while unvisited:
-            nearest_idx = None
-            min_distance = float('inf')
-            
-            for container_idx in unvisited:
-                container = containers[container_idx - 1]
-                distance = distance_matrix[current_pos][container_idx]
-                
-                # Aplicar peso de prioridad
-                weighted_distance = distance / container.priority
-                
-                if weighted_distance < min_distance:
-                    min_distance = weighted_distance
-                    nearest_idx = container_idx
-            
-            if nearest_idx:
-                route.append(nearest_idx)
-                current_pos = nearest_idx
-                unvisited.remove(nearest_idx)
-        
-        return route
+            nearest_idx = min(
+                unvisited,
+                key=lambda x: distance_matrix[current_pos][x] / containers[x].priority
+            )
+            route_order.append(nearest_idx)
+            current_pos = nearest_idx
+            unvisited.remove(nearest_idx)
+
+        return route_order
+
     
     def _calculate_route_distance_from_matrix(self, route_order: List[int], 
                                             distance_matrix: List[List[float]]) -> float:
@@ -613,7 +588,93 @@ class RouteOptimizer:
         return route_order, total_distance
 
 
-# Función para integrar con tu código existente
+def compare_optimization_methods(self, containers: List[Container], n_runs=10):
+    results = []
+    for _ in range(n_runs):
+        # Probar diferentes métodos
+        nn_result = self.simple_route_optimization(containers)
+        ga_result = self.genetic_algorithm_vrp(containers, [Vehicle("default", 5000, self.depot_lat, self.depot_lon)])
+        
+        results.append({
+            "method": ["Nearest Neighbor", "Genetic Algorithm"],
+            "distance": [nn_result["total_distance"], ga_result["total_distance"]],
+            "time": [nn_result["routes"][0]["estimated_time_minutes"], 
+                    ga_result["routes"][0]["estimated_time_minutes"]]
+        })
+    
+    return pd.DataFrame(results).groupby("method").mean()
+
+
+class HybridRouteOptimizer(RouteOptimizer):
+    """Optimizador híbrido que combina LSTM + Optimización espacial"""
+    
+    def __init__(self, api_key: Optional[str] = None):
+        super().__init__(api_key)
+        self.lstm_predictor = lstm_predictor
+    
+    def calculate_dynamic_priority(self, container: Container, 
+                                 historical_data: pd.DataFrame) -> float:
+        """Calcular prioridad dinámica usando LSTM"""
+        if not self.lstm_predictor.is_loaded:
+            # Fallback a prioridad basada en llenado actual
+            return min(2.0, 1.0 + (container.fill_percentage / 100))
+        
+        try:
+            # Obtener predicción LSTM
+            prediction = self.lstm_predictor.predict_fill_trend(
+                historical_data, container.id
+            )
+            
+            if "error" in prediction:
+                # Fallback si hay error en LSTM
+                base_priority = 1.0 + (container.fill_percentage / 50)
+                return min(3.0, base_priority)
+            
+            # Calcular prioridad basada en predicción LSTM
+            predicted_fill = prediction["predicted_fill_24h"]
+            fill_rate = prediction["hourly_fill_rate"]
+            confidence = prediction["confidence"]
+            
+            # Fórmula de prioridad dinámica
+            time_to_critical = (95 - container.fill_percentage) / fill_rate if fill_rate > 0 else 48
+            urgency_factor = max(0.1, 24 / (time_to_critical + 1))
+            
+            dynamic_priority = (container.fill_percentage / 30) + urgency_factor
+            return min(4.0, max(1.0, dynamic_priority * confidence))
+            
+        except Exception as e:
+            print(f"Error calculando prioridad dinámica: {e}")
+            return 1.5  # Prioridad por defecto
+    
+    def optimize_with_lstm(self, containers: List[Container], 
+                          historical_data: pd.DataFrame,
+                          vehicles: List[Vehicle],
+                          use_genetic_algorithm: bool = True) -> Dict:
+        """Optimización híbrida LSTM + Routing"""
+        
+        # Actualizar prioridades usando LSTM
+        containers_with_dynamic_priority = []
+        for container in containers:
+            dynamic_priority = self.calculate_dynamic_priority(container, historical_data)
+            updated_container = Container(
+                id=container.id,
+                lat=container.lat,
+                lon=container.lon,
+                fill_percentage=container.fill_percentage,
+                priority=dynamic_priority,  # Prioridad dinámica
+                capacity=container.capacity
+            )
+            containers_with_dynamic_priority.append(updated_container)
+        
+        # Ejecutar optimización normal con prioridades actualizadas
+        if use_genetic_algorithm:
+            return self.genetic_algorithm_vrp(
+                containers_with_dynamic_priority, 
+                vehicles
+            )
+        else:
+            return self.optimize_route(containers_with_dynamic_priority)
+
 def create_openrouteservice_optimizer() -> Optional[RouteOptimizer]:
     """Factory function para crear optimizador"""
     try:
