@@ -329,7 +329,34 @@ async def optimize_routes(
 
     return optimization_result
 
-# Resto de endpoints permanecen igual...
+@router.post("/optimization-metrics")
+def calculate_optimization_metrics(
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+    """Comparación de algoritmos de optimización"""
+    # Ejecutar ambos algoritmos
+    genetic_result = genetic_algorithm_optimization(Container, Vehicle)
+    nn_result = simple_route_optimization(Container)
+    
+    return {
+        "genetic_algorithm": {
+            "distance_km": genetic_result["total_distance"],
+            "time_minutes": genetic_result["routes"][0]["estimated_time_minutes"],
+            "fuel_liters": genetic_result["routes"][0]["fuel_consumption_liters"]
+        },
+        "nearest_neighbor": {
+            "distance_km": nn_result["total_distance"],
+            "time_minutes": nn_result["routes"][0]["estimated_time_minutes"],
+            "fuel_liters": nn_result["routes"][0]["fuel_consumption_liters"]
+        },
+        "improvement_percentage": {
+            "distance": round((1 - genetic_result["total_distance"] / nn_result["total_distance"]) * 100, 1),
+            "time": round((1 - genetic_result["routes"][0]["estimated_time_minutes"] / nn_result["routes"][0]["estimated_time_minutes"]) * 100, 1),
+            "fuel": round((1 - genetic_result["routes"][0]["fuel_consumption_liters"] / nn_result["routes"][0]["fuel_consumption_liters"]) * 100, 1)
+        }
+    }
+
 @router.get("/", response_model=List[schemas.Route])
 def get_routes(
     skip: int = 0,
@@ -453,6 +480,111 @@ def execute_route(
         "collections": collections_made,
         "execution_time": datetime.utcnow().isoformat()
     }
+
+@router.post("/optimize-with-ai")
+async def optimize_routes_with_ai(
+    background_tasks: BackgroundTasks,
+    min_fill_threshold: float = 60.0,
+    use_lstm: bool = True,
+    use_genetic_algorithm: bool = True,
+    db: Session = Depends(get_db)
+):
+    """Optimización de rutas mejorada con IA (LSTM)"""
+    
+    # Obtener contenedores que necesitan recolección
+    containers_query = db.query(models.Container).filter(
+        models.Container.is_active == True,
+        models.Container.fill_percentage >= min_fill_threshold
+    )
+    
+    db_containers = containers_query.all()
+    
+    if not db_containers:
+        return {
+            "message": f"No hay contenedores que necesiten recolección (umbral: {min_fill_threshold}%)",
+            "routes": [],
+            "total_distance": 0.0,
+            "containers_count": 0
+        }
+    
+    # Obtener datos históricos para LSTM
+    since_date = datetime.utcnow() - timedelta(days=7)
+    historical_readings = db.query(models.SensorReading).filter(
+        models.SensorReading.timestamp >= since_date
+    ).all()
+    
+    # Convertir a DataFrame
+    historical_data = []
+    for reading in historical_readings:
+        historical_data.append({
+            'container_id': reading.container_id,
+            'timestamp': reading.timestamp,
+            'fill_percentage': reading.fill_percentage
+        })
+    
+    historical_df = pd.DataFrame(historical_data)
+    
+    # Convertir a objetos de optimización
+    containers_for_opt = []
+    for db_container in db_containers:
+        if db_container.latitude and db_container.longitude:
+            container_obj = Container(
+                id=db_container.id,
+                lat=db_container.latitude,
+                lon=db_container.longitude,
+                fill_percentage=db_container.fill_percentage,
+                priority=1.0  # Será actualizado por LSTM
+            )
+            containers_for_opt.append(container_obj)
+    
+    # Crear vehículos
+    vehicles = [Vehicle(
+        id="TRUCK-001",
+        capacity_kg=5000.0,
+        current_lat=-33.4119,
+        current_lon=-70.5241
+    )]
+    
+    # Ejecutar optimización híbrida
+    hybrid_optimizer = HybridRouteOptimizer()
+    
+    if use_lstm and historical_df.empty:
+        use_lstm = False
+        print("⚠️ No hay datos históricos, usando optimización tradicional")
+    
+    try:
+        if use_lstm:
+            optimization_result = hybrid_optimizer.optimize_with_lstm(
+                containers=containers_for_opt,
+                historical_data=historical_df,
+                vehicles=vehicles,
+                use_genetic_algorithm=use_genetic_algorithm
+            )
+            optimization_method = "hybrid_lstm_genetic" if use_genetic_algorithm else "hybrid_lstm_basic"
+        else:
+            # Fallback a optimización tradicional
+            if use_genetic_algorithm:
+                optimization_result = hybrid_optimizer.genetic_algorithm_vrp(
+                    containers_for_opt, vehicles
+                )
+                optimization_method = "genetic_algorithm"
+            else:
+                optimization_result = hybrid_optimizer.optimize_route(containers_for_opt)
+                optimization_method = "openrouteservice"
+        
+        optimization_result["optimization_method"] = optimization_method
+        optimization_result["ai_model_used"] = "lstm" if use_lstm else "traditional"
+        
+        # Guardar resultados en BD
+        if optimization_result.get("routes"):
+            self._save_optimization_result(optimization_result, db, optimization_method)
+        
+        return optimization_result
+        
+    except Exception as e:
+        print(f"Error en optimización con IA: {e}")
+        # Fallback a método simple
+        return await optimize_routes(background_tasks, min_fill_threshold, False, db)
 
 @router.get("/stats/efficiency")
 def get_route_efficiency_stats(db: Session = Depends(get_db)):

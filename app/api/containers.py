@@ -96,32 +96,52 @@ def get_container(container_id: int, db: Session = Depends(get_db)):
     
     return container
 
+@router.get("/iot-metrics")
+def get_iot_metrics(db: Session = Depends(get_db)):
+    """Métricas clave del sistema IoT"""
+    # Precisión de sensores (simulación)
+    total_containers = db.query(models.Container).count()
+    high_accuracy = db.query(models.Container).filter(models.Container.fill_percentage > 0).count()
+    accuracy_rate = (high_accuracy / total_containers) * 100 if total_containers > 0 else 0
+    
+    # Duración de batería
+    low_battery = db.query(models.Container).filter(models.Container.battery_level < 30).count()
+    battery_life = (1 - (low_battery / total_containers)) * 100
+    
+    # Conectividad (simulación)
+    active_containers = db.query(models.Container).filter(models.Container.is_active == True).count()
+    connectivity_rate = (active_containers / total_containers) * 100
+    
+    return {
+        "sensor_accuracy": round(accuracy_rate, 1),
+        "battery_life": round(battery_life, 1),
+        "connectivity_rate": round(connectivity_rate, 1),
+        "total_containers": total_containers,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
 @router.put("/{container_id}", response_model=schemas.Container)
 def update_container(
     container_id: int,
     container_update: schemas.ContainerUpdate,
     db: Session = Depends(get_db)
 ):
-    """Actualizar datos del contenedor"""
     container = db.query(models.Container).filter(models.Container.id == container_id).first()
     if not container:
         raise HTTPException(status_code=404, detail="Container not found")
     
     try:
-        # CORREGIDO: usar model_dump() en lugar de dict()
         update_data = container_update.model_dump(exclude_unset=True)
         
         for field, value in update_data.items():
             if value is not None:
                 setattr(container, field, value)
         
-        # Actualizar timestamp
+        # CORRECCIÓN: RECALCULAR SI SE ACTUALIZA current_level
+        if 'current_level' in update_data:
+            container.fill_percentage = min(100, (container.current_level / container.capacity) * 100)
+        
         container.last_update = datetime.utcnow()
-        
-        # Recalcular current_level basado en fill_percentage
-        if container.fill_percentage is not None and container.capacity:
-            container.current_level = (container.fill_percentage / 100) * container.capacity
-        
         db.commit()
         db.refresh(container)
         return container
@@ -158,39 +178,54 @@ def get_container_history(
 
 @router.post("/simulate-data")
 def simulate_container_data(db: Session = Depends(get_db)):
-    """Simular datos IoT"""
+    """Simular datos IoT corregidos"""
     try:
         containers = db.query(models.Container).filter(models.Container.is_active == True).all()
-        
         updated_count = 0
+
+        total_error = 0.0  # Para mostrar error promedio de sensores (simulado)
+        total_battery_drain = 0.0
+
         for container in containers:
-            # Simular incremento gradual del llenado
-            current_fill = float(container.fill_percentage or 0)
-            fill_increment = random.uniform(0.5, 3.0)  # Incremento más realista
-            new_fill = min(100.0, current_fill + fill_increment)
-            
-            container.fill_percentage = new_fill
-            container.current_level = (new_fill / 100) * float(container.capacity)
-            container.temperature = random.uniform(15, 30)
-            
-            # Simular descarga lenta de batería
-            current_battery = float(container.battery_level or 100)
-            battery_drain = random.uniform(0.01, 0.05)
-            container.battery_level = max(10.0, current_battery - battery_drain)
-            
+            # Aumentar el nivel de llenado de forma gradual
+            increment = random.uniform(5.0, 25.0)  # Litros, por ejemplo
+            current_level = container.current_level or 0.0
+            capacity = container.capacity or 1.0  # Evitar división por 0
+
+            new_level = min(capacity, current_level + increment)
+            container.current_level = new_level
+
+            # Calcular fill_percentage real
+            container.fill_percentage = round((new_level / capacity) * 100, 2)
+
+            # Simular temperatura ambiental
+            container.temperature = round(random.uniform(15, 30), 1)
+
+            # Simular consumo de batería
+            battery = container.battery_level or 100.0
+            battery_drain = round(random.uniform(0.5, 1.5), 2)
+            container.battery_level = max(0.0, battery - battery_drain)
+            total_battery_drain += battery_drain
+
+            # Registrar última actualización
             container.last_update = datetime.utcnow()
             updated_count += 1
-        
+
         db.commit()
+
+        avg_battery_drain = total_battery_drain / updated_count if updated_count > 0 else 0
+
         return {
-            "message": "Data simulation completed successfully",
+            "message": "Simulación completada con éxito",
             "containers_updated": updated_count,
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.utcnow().isoformat(),
+            "avg_battery_drain": round(avg_battery_drain, 2)
         }
-        
+
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error simulating data: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error simulando datos: {str(e)}")
+
 
 @router.get("/{container_id}/alerts")
 def get_container_alerts(container_id: int, db: Session = Depends(get_db)):

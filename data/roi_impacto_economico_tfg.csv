@@ -1,0 +1,9 @@
+Concepto,Valor (USD),Descripción
+Inversión inicial,75000,Coste total estimado para implementar el sistema inteligente
+Ahorro anual combustible,18500,Ahorro anual por reducción en el consumo de combustible (18.7%)
+Ahorro anual mantenimiento vehicular,7200,Disminución de gastos de mantenimiento fruto de rutas optimizadas
+Ahorro anual horas-hombre,15000,Reducción de coste operativo por menor tiempo de recolección (21.4%)
+Ahorro total anual,40700,Suma de los tres ahorros principales
+Coste operativo anual,20000,Costos recurrentes de operación y mantenimiento de la plataforma
+Periodo de recuperación (años),2.5,Años estimados para recuperar la inversión inicial
+ROI a 3 años,(Ahorro total anual x 3 - Inversión inicial) / Inversión inicial,Fórmula para calcular el retorno de inversión acumulado en tres años
