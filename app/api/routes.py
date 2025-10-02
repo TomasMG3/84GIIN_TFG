@@ -215,29 +215,28 @@ def genetic_algorithm_optimization(containers: List[OptimizationContainer], vehi
 async def optimize_routes(
     background_tasks: BackgroundTasks,
     min_fill_threshold: float = 70.0,
-    use_genetic_algorithm: bool = False,
+    use_genetic_algorithm: bool = True,
+    include_nearby_overflow: bool = True,
     db: Session = Depends(get_db)
 ):
     """
-    Optimizar rutas de recolección
+    Optimizar rutas de recolección con priorización de desbordamientos
     
     Args:
-        min_fill_threshold: Umbral mínimo de llenado para incluir contenedor
+        min_fill_threshold: Umbral mínimo de llenado para incluir contenedor (default 70%)
         use_genetic_algorithm: Si usar algoritmo genético avanzado
+        include_nearby_overflow: Si incluir contenedores con desbordamiento cercanos
     """
-    # Obtener contenedores que necesitan recolección
-    containers_query = db.query(models.Container).filter(
-        models.Container.is_active == True,
-        models.Container.fill_percentage >= min_fill_threshold
+    # Obtener TODOS los contenedores activos
+    all_containers_query = db.query(models.Container).filter(
+        models.Container.is_active == True
     )
     
-    db_containers = containers_query.all()
+    db_containers = all_containers_query.all()
     
     if not db_containers:
         return {
-            "message": f"No hay contenedores que necesiten recolección (umbral: {min_fill_threshold}%)",
-            "containers_checked": db.query(models.Container).filter(models.Container.is_active == True).count(),
-            "threshold": min_fill_threshold,
+            "message": "No hay contenedores activos en el sistema",
             "routes": [],
             "total_distance": 0.0,
             "containers_count": 0
@@ -250,57 +249,90 @@ async def optimize_routes(
             print(f"Container {db_container.id} missing coordinates, skipping.")
             continue
             
-        containers_for_opt.append(OptimizationContainer(
+        # Crear contenedor con todos los datos necesarios
+        container = Container(
             id=db_container.id,
             lat=db_container.latitude,
             lon=db_container.longitude,
             fill_percentage=db_container.fill_percentage,
-            priority=1.5 if db_container.fill_percentage > 90 else 1.0
-        ))
+            priority=1.0,  # Será calculado por el optimizador
+            capacity=db_container.capacity if hasattr(db_container, 'capacity') else 1000.0,
+            is_overflow=(db_container.fill_percentage > 100)
+        )
+        
+        containers_for_opt.append(container)
     
     if not containers_for_opt:
         return {
-            "message": "Contenedores encontrados pero ninguno tiene coordenadas válidas para optimización.",
-            "details": f"{len(db_containers)} contenedores cumplen el umbral pero no tienen coordenadas válidas",
+            "message": "No hay contenedores con coordenadas válidas",
             "routes": [],
             "total_distance": 0.0,
             "containers_count": 0
         }
-
-    # Crear vehículos
-    vehicles = [Vehicle(
-        id="TRUCK-001",
-        capacity_kg=5000.0,
-        current_lat=-33.4119,
-        current_lon=-70.5241
-    )]
-
+    
+    print(f"\n{'='*60}")
+    print(f"🚀 INICIANDO OPTIMIZACIÓN DE RUTAS")
+    print(f"{'='*60}")
+    print(f"📊 Contenedores totales: {len(containers_for_opt)}")
+    print(f"📏 Umbral mínimo: {min_fill_threshold}%")
+    print(f"🧬 Algoritmo genético: {'SÍ' if use_genetic_algorithm else 'NO'}")
+    print(f"🎯 Incluir desbordamientos cercanos: {'SÍ' if include_nearby_overflow else 'NO'}")
+    
+    # Estadísticas previas
+    total_containers = len(containers_for_opt)
+    overflow_count = sum(1 for c in containers_for_opt if c.fill_percentage > 100)
+    above_threshold = sum(1 for c in containers_for_opt if c.fill_percentage >= min_fill_threshold)
+    below_threshold = total_containers - above_threshold
+    
+    print(f"\n📈 ANÁLISIS PREVIO:")
+    print(f"   • Desbordamientos (>100%): {overflow_count}")
+    print(f"   • Sobre umbral (≥{min_fill_threshold}%): {above_threshold}")
+    print(f"   • Bajo umbral (<{min_fill_threshold}%): {below_threshold}")
+    
     optimization_result = {}
-    optimization_method_used = "openrouteservice"
+    optimization_method_used = "priority_based_with_overflow"
 
     try:
         # Verificar disponibilidad de OpenRouteService
         if not check_openrouteservice_available():
-            print("OpenRouteService no está disponible. Usando optimización simple.")
-            optimization_result = simple_route_optimization(containers_for_opt)
+            print("\n⚠️ OpenRouteService no está disponible. Usando optimización simple.")
+            optimization_result = simple_route_optimization(
+                [OptimizationContainer(c.id, c.lat, c.lon, c.fill_percentage, c.priority) 
+                 for c in containers_for_opt if c.fill_percentage >= min_fill_threshold]
+            )
             optimization_method_used = "nearest_neighbor_fallback"
             optimization_result["message"] = "OpenRouteService no disponible. Se usó optimización simple."
         else:
-            # OpenRouteService disponible
-            if use_genetic_algorithm:
-                # Intentar algoritmo genético avanzado
-                optimization_result = genetic_algorithm_optimization(containers_for_opt, vehicles)
-                optimization_method_used = "genetic_algorithm_openrouteservice"
-            else:
-                # Usar optimización básica con OpenRouteService
-                optimization_result = openrouteservice_optimized_route(containers_for_opt)
-                optimization_method_used = optimization_result.get("optimization_method", "openrouteservice")
+            # OpenRouteService disponible - usar optimización avanzada
+            optimizer = RouteOptimizer()
+            
+            # Usar el método mejorado con prioridades y desbordamientos
+            optimization_result = optimizer.optimize_route_with_priorities(
+                containers_for_opt, 
+                min_threshold=min_fill_threshold
+            )
+            
+            optimization_method_used = optimization_result.get("optimization_method", "priority_based_with_overflow")
+            
+            # Mostrar estadísticas de la optimización
+            print(f"\n✅ OPTIMIZACIÓN COMPLETADA:")
+            print(f"   • Método: {optimization_method_used}")
+            print(f"   • Contenedores en ruta: {optimization_result.get('containers_count', 0)}")
+            print(f"   • Viajes innecesarios evitados: {optimization_result.get('unnecessary_trips_avoided', 0)}")
+            print(f"   • Desbordamientos agregados: {optimization_result.get('overflow_containers_added', 0)}")
+            print(f"   • Distancia total: {optimization_result.get('total_distance', 0):.2f} km")
                 
     except Exception as e:
-        print(f"Error inesperado en optimización: {e}")
-        optimization_result = simple_route_optimization(containers_for_opt)
+        print(f"\n❌ ERROR en optimización: {e}")
+        print(f"Traceback: {traceback.format_exc()}")
+        
+        # Fallback a método simple
+        optimization_result = simple_route_optimization(
+            [OptimizationContainer(c.id, c.lat, c.lon, c.fill_percentage, c.priority) 
+             for c in containers_for_opt if c.fill_percentage >= min_fill_threshold]
+        )
         optimization_method_used = "nearest_neighbor_fallback"
-        optimization_result["message"] = f"Error en optimización: {e}. Se usó optimización simple."
+        optimization_result["message"] = f"Error en optimización: {str(e)}. Se usó optimización simple."
 
     # Guardar ruta optimizada en BD si se generó una ruta válida
     if optimization_result.get("routes") and len(optimization_result["routes"]) > 0:
@@ -313,7 +345,7 @@ async def optimize_routes(
             co2_emissions_kg=route_data.get("co2_emissions_kg"),
             containers_count=optimization_result["containers_count"],
             optimization_algorithm=optimization_method_used,
-            is_optimized=(optimization_method_used in ["genetic_algorithm_openrouteservice", "openrouteservice", "openrouteservice_matrix"]),
+            is_optimized=True,
             route_coordinates=route_data.get("route_coordinates")
         )
         
@@ -323,10 +355,14 @@ async def optimize_routes(
         
         optimization_result["route_id"] = route.id
         optimization_result["optimization_method"] = optimization_method_used
+        
+        print(f"\n💾 Ruta guardada en BD con ID: {route.id}")
     else:
         if "message" not in optimization_result:
             optimization_result["message"] = "No se pudo generar una ruta válida."
-
+    
+    print(f"{'='*60}\n")
+    
     return optimization_result
 
 @router.post("/optimization-metrics")

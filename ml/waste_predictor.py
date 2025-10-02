@@ -3,18 +3,27 @@ import numpy as np
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.linear_model import LinearRegression
+from sklearn.neural_network import MLPRegressor
 import xgboost as xgb
 from datetime import datetime, timedelta
-import joblib
+from sklearn.model_selection import KFold
 from typing import Dict, List, Optional, Any
+from time import time
+from sklearn.svm import SVR
+from sklearn.ensemble import GradientBoostingRegressor
+
 
 class WastePredictor:
     def __init__(self):
         self.models = {
             'random_forest': RandomForestRegressor(n_estimators=100, random_state=42),
-            'xgboost': xgb.XGBRegressor(random_state=42)
+            'xgboost': xgb.XGBRegressor(random_state=42),
+            'linear_regression': LinearRegression(),
+            'neural_network': MLPRegressor(hidden_layer_sizes=(50,), max_iter=1000)
         }
         self.trained_models = {}
+        self.feature_importances = {}
         self.feature_columns = []
         
     def create_features(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -35,51 +44,91 @@ class WastePredictor:
         df['day_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
         df['day_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
         
-        # Codificar zona (one-hot encoding)
-        if 'zone' in df.columns:
-            zone_dummies = pd.get_dummies(df['zone'], prefix='zone')
-            df = pd.concat([df, zone_dummies], axis=1)
-        
-        # Eliminar columnas no numéricas
-        df = df.drop(columns=['container_id', 'timestamp', 'zone'], errors='ignore')
+        # Don't drop categorical columns here - we'll handle them in train_models
+        # Just remove non-feature columns
+        df = df.drop(columns=['container_id', 'timestamp'], errors='ignore')
         
         return df
     
     def train_models(self, df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
-        """Entrena modelos predictivos"""
-        # Preparar datos
+        """Entrena modelos predictivos con validación cruzada"""
+        # Preprocesamiento
         df_features = self.create_features(df)
         
-        # Seleccionar features
-        feature_cols = [col for col in df_features.columns if col not in ['container_id', 'timestamp', 'fill_percentage']]
+        # One-Hot Encoding
+        categorical_cols = ['area_type', 'zone']
+        for col in categorical_cols:
+            if col in df_features.columns:
+                dummies = pd.get_dummies(df_features[col], prefix=col)
+                df_features = pd.concat([df_features, dummies], axis=1)
+                df_features = df_features.drop(columns=[col], errors='ignore')
         
-        X = df_features[feature_cols].fillna(0)
+        # Selección de features
+        feature_cols = [col for col in df_features.columns 
+                    if col not in ['container_id', 'timestamp', 'fill_percentage']]
+        X = df_features[feature_cols].apply(pd.to_numeric, errors='coerce').fillna(0)
         y = df_features['fill_percentage']
         
-        # Dividir datos
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42
-        )
-        
+        # Inicializar atributos
         self.feature_columns = feature_cols
-        results = {}
+        self.feature_importances = {}  # Asegurar que está inicializado
+        cv_metrics = {}
         
-        # Entrenar cada modelo
         for name, model in self.models.items():
-            model.fit(X_train, y_train)
-            predictions = model.predict(X_test)
+            print(f"Entrenando {name}...")
+            start_time = time()
             
-            mae = mean_absolute_error(y_test, predictions)
-            r2 = r2_score(y_test, predictions)
+            # Validación cruzada
+            kf = KFold(n_splits=5)
+            maes, r2s, train_times = [], [], []
             
-            self.trained_models[name] = model
-            results[name] = {
-                'mae': round(mae, 3),
-                'r2': round(r2, 3),
-                'accuracy': round((1 - mae/100) * 100, 1)
+            # Listas para almacenar importancias por fold
+            fold_importances = []
+            
+            for train_idx, test_idx in kf.split(X):
+                X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+                y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+                
+                # Entrenamiento
+                train_start = time()
+                model.fit(X_train, y_train)
+                train_times.append(time() - train_start)
+                
+                # Predicción
+                preds = model.predict(X_test)
+                maes.append(mean_absolute_error(y_test, preds))
+                r2s.append(r2_score(y_test, preds))
+                
+                # Recolectar importancias por fold (si aplica)
+                if hasattr(model, 'feature_importances_'):
+                    fold_importances.append(model.feature_importances_)
+            
+            # Guardar métricas
+            cv_metrics[name] = {
+                'MAE_promedio': round(np.mean(maes), 2),
+                'MAE_std': round(np.std(maes), 2),
+                'R2_promedio': round(np.mean(r2s), 3),
+                'Tiempo_entrenamiento_promedio': round(np.mean(train_times), 2),
+                'n_features': len(feature_cols)
             }
+            
+            # Guardar modelo y promediar importancias
+            self.trained_models[name] = model
+            
+            if fold_importances:
+                self.feature_importances[name] = {
+                    'features': feature_cols,
+                    'importance': np.mean(fold_importances, axis=0).tolist(),
+                    'std': np.std(fold_importances, axis=0).tolist()
+                }
+            elif hasattr(model, 'coef_'):  # Para modelos lineales
+                self.feature_importances[name] = {
+                    'features': feature_cols,
+                    'importance': abs(model.coef_[0]).tolist(),  # Valor absoluto
+                    'std': None
+                }
         
-        return results
+        return cv_metrics
     
     def predict_fill_time(self, container_id: int, current_fill: float, zone: Optional[str] = None) -> Dict[str, Any]:
         """Predice cuándo se llenará un contenedor"""

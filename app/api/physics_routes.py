@@ -2,11 +2,11 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from typing import Dict, List
+from app import physics_simulator 
 import json
 
 from app.database import get_db
 from app import models
-from physics_simulator import physics_simulator
 
 router = APIRouter()
 

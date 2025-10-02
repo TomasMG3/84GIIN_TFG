@@ -1,14 +1,14 @@
-# route_optimizer.py - Optimizador completo con OpenRouteService y Algoritmo Genético
-
 import requests
 import json
 import math
 import random
 import numpy as np
+import pandas as pd
 from typing import List, Dict, Optional, Tuple
 import os
 from dataclasses import dataclass
 from datetime import datetime
+import polyline
 
 @dataclass
 class Container:
@@ -17,7 +17,8 @@ class Container:
     lon: float
     fill_percentage: float
     priority: float = 1.0
-    capacity: float = 1000.0  # Capacidad en litros
+    capacity: float = 1000.0
+    is_overflow: bool = False  # Nuevo campo para desbordamiento
     
 @dataclass
 class Vehicle:
@@ -25,20 +26,19 @@ class Vehicle:
     capacity_kg: float
     current_lat: float
     current_lon: float
-    fuel_efficiency: float = 0.35  # L/km
-    speed_kmh: float = 25.0  # km/h promedio en ciudad
+    fuel_efficiency: float = 0.35
+    speed_kmh: float = 25.0
 
 class RouteOptimizer:
     def __init__(self, api_key: Optional[str] = None):
-        # Obtener API key desde variable de entorno o parámetro
         self.api_key = api_key or os.getenv('OPENROUTESERVICE_API_KEY')
         if not self.api_key:
-            print("Warning: OpenRouteService API key is not configured. Using fallback methods.")
+            print("Warning: OpenRouteService API key is not configured.")
         
         self.base_url = "https://api.openrouteservice.org"
-        self.depot_lat = -33.4119
-        self.depot_lon = -70.5241
-        self.max_locations = 50  # Límite de OpenRouteService gratuito
+        self.depot_lat = -33.4166986
+        self.depot_lon = -70.5179074
+        self.max_locations = 50
         
     def calculate_distance(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
         """Calcula distancia haversine en km"""
@@ -57,166 +57,112 @@ class RouteOptimizer:
         
         return R * c
     
-    def is_openrouteservice_available(self) -> bool:
-        """Verifica si OpenRouteService está disponible"""
-        if not self.api_key:
-            return False
+    def filter_unnecessary_trips(self, containers: List[Container], min_threshold: float = 70.0) -> Tuple[List[Container], List[Container]]:
+        """
+        Filtra contenedores según umbral y clasifica viajes innecesarios
+        PRIORIZA contenedores con desbordamiento (>100%) si están cerca de la ruta
         
-        try:
-            url = f"{self.base_url}/v2/matrix/driving-car"
-            headers = {
-                'Accept': 'application/json',
-                'Authorization': self.api_key,
-                'Content-Type': 'application/json; charset=utf-8'
-            }
-            body = {
-                "locations": [[self.depot_lon, self.depot_lat], [self.depot_lon + 0.001, self.depot_lat + 0.001]],
-                "metrics": ["distance"]
-            }
-            
-            response = requests.post(url, json=body, headers=headers, timeout=5)
-            return response.status_code == 200
-        except:
-            return False
-    
-    def get_distance_matrix(self, containers: List[Container]) -> Optional[List[List[float]]]:
-        """Obtiene matriz de distancias usando OpenRouteService Matrix API"""
+        Returns:
+            Tuple de (contenedores_necesarios, contenedores_innecesarios)
+        """
+        necessary = []
+        unnecessary = []
+        overflow_containers = []
         
-        if not self.api_key:
-            return None
-        
-        # Preparar coordenadas [lon, lat] (OpenRouteService usa este formato)
-        locations = [[self.depot_lon, self.depot_lat]]  # Depot primero
-        locations.extend([[c.lon, c.lat] for c in containers])
-        
-        # Verificar límite
-        if len(locations) > self.max_locations:
-            print(f"Demasiadas ubicaciones ({len(locations)}). Límite: {self.max_locations}")
-            return None
-        
-        url = f"{self.base_url}/v2/matrix/driving-car"
-        
-        headers = {
-            'Accept': 'application/json',
-            'Authorization': self.api_key,
-            'Content-Type': 'application/json; charset=utf-8'
-        }
-        
-        body = {
-            "locations": locations,
-            "metrics": ["distance", "duration"],
-            "units": "km"
-        }
-        
-        try:
-            response = requests.post(url, json=body, headers=headers, timeout=15)
-            
-            if response.status_code == 200:
-                data = response.json()
-                if 'distances' in data:
-                    return data['distances']
+        for container in containers:
+            # Clasificar por desbordamiento primero
+            if container.fill_percentage > 100:
+                container.is_overflow = True
+                container.priority = 5.0  # Máxima prioridad - CRÍTICO
+                overflow_containers.append(container)
+                necessary.append(container)
+            elif container.fill_percentage >= min_threshold:
+                # Contenedores normales sobre umbral
+                if container.fill_percentage >= 95:
+                    container.priority = 3.0  # Muy alta prioridad
+                elif container.fill_percentage >= 90:
+                    container.priority = 2.5  # Alta prioridad
+                elif container.fill_percentage >= 80:
+                    container.priority = 2.0  # Prioridad media-alta
                 else:
-                    print(f"OpenRouteService no devolvió 'distances': {data}")
-                    return None
-            else:
-                print(f"Error OpenRouteService Matrix: {response.status_code} - {response.text}")
-                return None
+                    container.priority = 1.0  # Prioridad normal
                 
-        except requests.exceptions.RequestException as e:
-            print(f"Error de conexión con OpenRouteService: {e}")
-            return None
-    
-    def get_route_geometry(self, containers: List[Container], route_order: List[int]) -> Optional[List[List[float]]]:
-        """Obtiene geometría de ruta usando OpenRouteService Directions API"""
-        
-        if not self.api_key:
-            return None
-        
-        # Construir coordenadas en orden de visita
-        coordinates = [[self.depot_lon, self.depot_lat]]  # Depot
-        
-        for container_idx in route_order:
-            container = containers[container_idx - 1]  # -1 porque índices empiezan en 1
-            coordinates.append([container.lon, container.lat])
-        
-        coordinates.append([self.depot_lon, self.depot_lat])  # Regreso al depot
-        
-        url = f"{self.base_url}/v2/directions/driving-car"
-        
-        headers = {
-            'Accept': 'application/json',
-            'Authorization': self.api_key,
-            'Content-Type': 'application/json; charset=utf-8'
-        }
-        
-        body = {
-            "coordinates": coordinates,
-            "format": "geojson"
-        }
-        
-        try:
-            response = requests.post(url, json=body, headers=headers, timeout=15)
-            
-            if response.status_code == 200:
-                data = response.json()
-                if 'features' in data and len(data['features']) > 0:
-                    geometry = data['features'][0]['geometry']
-                    if geometry['type'] == 'LineString':
-                        return geometry['coordinates']
-                    else:
-                        print(f"Geometría inesperada: {geometry['type']}")
-                        return None
-                else:
-                    print(f"No se encontraron features en respuesta: {data}")
-                    return None
+                necessary.append(container)
             else:
-                print(f"Error OpenRouteService Directions: {response.status_code} - {response.text}")
-                return None
-                
-        except requests.exceptions.RequestException as e:
-            print(f"Error de conexión con OpenRouteService Directions: {e}")
-            return None
-    
-    def optimize_route(self, containers: List[Container]) -> Dict:
-        """Optimiza ruta usando OpenRouteService con fallback a Haversine"""
+                # Viaje innecesario - bajo umbral
+                unnecessary.append(container)
         
+        # Log para debugging
+        print(f"✅ Contenedores necesarios: {len(necessary)} (Desbordamientos: {len(overflow_containers)})")
+        print(f"❌ Viajes innecesarios evitados: {len(unnecessary)}")
+        
+        return necessary, unnecessary
+    
+    def optimize_route_with_priorities(self, containers: List[Container], min_threshold: float = 70.0) -> Dict:
+        """
+        Optimiza ruta considerando prioridades y omitiendo viajes innecesarios
+        """
         if not containers:
             return {
                 "routes": [],
                 "total_distance": 0.0,
                 "containers_count": 0,
-                "optimization_method": "openrouteservice"
+                "unnecessary_trips_avoided": 0,
+                "optimization_method": "priority_based"
             }
         
-        # Intentar obtener matriz de distancias real
-        distance_matrix = self.get_distance_matrix(containers)
+        # Filtrar viajes innecesarios
+        necessary_containers, unnecessary_containers = self.filter_unnecessary_trips(
+            containers, min_threshold
+        )
+        
+        print(f"✅ Contenedores necesarios: {len(necessary_containers)}")
+        print(f"❌ Viajes innecesarios evitados: {len(unnecessary_containers)}")
+        
+        if not necessary_containers:
+            return {
+                "routes": [],
+                "total_distance": 0.0,
+                "containers_count": 0,
+                "unnecessary_trips_avoided": len(unnecessary_containers),
+                "message": "No hay contenedores que requieran recolección",
+                "optimization_method": "priority_based"
+            }
+        
+        # Ordenar por prioridad (desbordamiento primero)
+        sorted_containers = sorted(
+            necessary_containers, 
+            key=lambda c: (c.is_overflow, c.priority, c.fill_percentage), 
+            reverse=True
+        )
+        
+        # Obtener matriz de distancias
+        distance_matrix = self.get_distance_matrix(sorted_containers)
         
         if not distance_matrix:
-            raise RuntimeError("No se pudo obtener la matriz de distancias desde OpenRouteService. Verifica tu API Key y conexión.")
-            
-        # Usar distancias reales para optimización
-        route_order = self._nearest_neighbor_with_matrix(containers, distance_matrix)
+            print("⚠️ No se pudo obtener matriz de distancias, usando Haversine")
+            distance_matrix = self._create_haversine_matrix(sorted_containers)
+        
+        # Aplicar algoritmo genético con prioridades
+        route_order = self._genetic_algorithm_with_priorities(
+            sorted_containers, 
+            distance_matrix
+        )
+        
+        # Calcular distancia total
         total_distance = self._calculate_route_distance_from_matrix(route_order, distance_matrix)
-        optimization_method = "openrouteservice_matrix"
         
-        # Obtener geometría de ruta real
-        route_geometry = None
-        if distance_matrix:  # Solo si OpenRouteService está funcionando
-            route_geometry = self.get_route_geometry(containers, route_order)
-        
-        # Construir respuesta
+        # Construir respuesta con geometría
         route_containers = []
         for i, container_idx in enumerate(route_order, 1):
-            container = containers[container_idx - 1]
+            container = sorted_containers[container_idx]
             
-            # Calcular distancia desde el punto anterior
             if i == 1:
-                # Distancia desde depot
                 distance_from_previous = self.calculate_distance(
                     self.depot_lat, self.depot_lon, container.lat, container.lon
                 )
             else:
-                prev_container = containers[route_order[i-2] - 1]
+                prev_container = sorted_containers[route_order[i-2]]
                 distance_from_previous = self.calculate_distance(
                     prev_container.lat, prev_container.lon, container.lat, container.lon
                 )
@@ -226,9 +172,16 @@ class RouteOptimizer:
                 "latitude": container.lat,
                 "longitude": container.lon,
                 "fill_percentage": container.fill_percentage,
+                "priority": container.priority,
+                "is_overflow": container.is_overflow,
                 "distance_from_previous": round(distance_from_previous, 2),
                 "order": i
             })
+        
+        # Obtener geometría de ruta real
+        route_geometry = None
+        if len(sorted_containers) + 2 <= self.max_locations:
+            route_geometry = self.get_route_geometry(sorted_containers, route_order)
         
         # Estimaciones
         estimated_time = int(total_distance * 2.5 + len(route_containers) * 5)
@@ -242,119 +195,233 @@ class RouteOptimizer:
             "estimated_time_minutes": estimated_time,
             "fuel_consumption_liters": round(fuel_consumption, 2),
             "co2_emissions_kg": round(co2_emissions, 2),
-            "depot_location": {"lat": self.depot_lat, "lon": self.depot_lon}
+            "depot_location": {"lat": self.depot_lat, "lon": self.depot_lon},
+            "overflow_containers": sum(1 for c in route_containers if c["is_overflow"]),
+            "high_priority_containers": sum(1 for c in route_containers if c["priority"] >= 2.0)
         }
         
-        # Agregar geometría si está disponible
         if route_geometry:
             route_data["route_coordinates"] = route_geometry
         
         return {
             "routes": [route_data],
             "total_distance": round(total_distance, 2),
-            "containers_count": len(containers),
-            "optimization_method": optimization_method
+            "containers_count": len(necessary_containers),
+            "unnecessary_trips_avoided": len(unnecessary_containers),
+            "optimization_method": "genetic_algorithm_with_priorities"
         }
     
-    def genetic_algorithm_vrp(self, containers: List[Container], vehicles: List[Vehicle], 
-                            population_size: int = 30, generations: int = 50) -> Dict:
+    def _genetic_algorithm_with_priorities(self, containers: List[Container], 
+                                          distance_matrix: List[List[float]],
+                                          population_size: int = 50,
+                                          generations: int = 100) -> List[int]:
         """
-        Algoritmo genético para Vehicle Routing Problem (VRP)
-        
-        Args:
-            containers: Lista de contenedores
-            vehicles: Lista de vehículos disponibles
-            population_size: Tamaño de la población
-            generations: Número de generaciones
-        
-        Returns:
-            Diccionario con las rutas optimizadas
+        Algoritmo genético optimizado con prioridades
         """
+        n = len(containers)
+        if n == 0:
+            return []
         
-        if not containers:
-            return {
-                "routes": [],
-                "total_distance": 0.0,
-                "containers_count": 0,
-                "optimization_method": "genetic_algorithm"
-            }
-        
-        # Obtener matriz de distancias
-        distance_matrix = self.get_distance_matrix(containers)
-        if not distance_matrix:
-            # Fallback a matriz Haversine
-            distance_matrix = self._create_haversine_matrix(containers)
-        
-        # Inicializar población
-        population = self._initialize_population(containers, vehicles, population_size)
+        # Crear población inicial considerando prioridades
+        population = []
+        for _ in range(population_size):
+            # Crear individuo con bias hacia contenedores de alta prioridad al inicio
+            individual = list(range(n))
+            
+            # Ordenar parcialmente por prioridad
+            high_priority_indices = [i for i, c in enumerate(containers) if c.is_overflow]
+            medium_priority_indices = [i for i, c in enumerate(containers) if c.priority >= 2.0 and not c.is_overflow]
+            normal_priority_indices = [i for i in range(n) if i not in high_priority_indices + medium_priority_indices]
+            
+            # Mezclar cada grupo
+            random.shuffle(high_priority_indices)
+            random.shuffle(medium_priority_indices)
+            random.shuffle(normal_priority_indices)
+            
+            # Combinar con cierta aleatoriedad
+            if random.random() < 0.7:  # 70% mantiene prioridades
+                individual = high_priority_indices + medium_priority_indices + normal_priority_indices
+            else:  # 30% completamente aleatorio
+                random.shuffle(individual)
+            
+            population.append(individual)
         
         best_solution = None
         best_fitness = float('inf')
         
-        print(f"Iniciando algoritmo genético: {population_size} individuos, {generations} generaciones")
-        
         for generation in range(generations):
-            # Evaluar fitness de cada individuo
+            # Evaluar fitness
             fitness_scores = []
             for individual in population:
-                fitness = self._evaluate_fitness(individual, distance_matrix, vehicles)
+                fitness = self._evaluate_fitness_with_priority(
+                    individual, distance_matrix, containers
+                )
                 fitness_scores.append(fitness)
                 
                 if fitness < best_fitness:
                     best_fitness = fitness
                     best_solution = individual.copy()
             
-            # Selección, cruzamiento y mutación
+            # Selección y reproducción
             new_population = []
             
-            # Elitismo: mantener los mejores individuos
-            elite_count = max(1, population_size // 10)
+            # Elitismo
+            elite_count = max(2, population_size // 10)
             elite_indices = sorted(range(len(fitness_scores)), key=lambda i: fitness_scores[i])[:elite_count]
             for idx in elite_indices:
                 new_population.append(population[idx].copy())
             
             # Generar nueva población
             while len(new_population) < population_size:
-                # Selección por torneo
-                parent1 = self._tournament_selection(population, fitness_scores)
-                parent2 = self._tournament_selection(population, fitness_scores)
+                parent1 = self._tournament_selection(population, fitness_scores, 3)
+                parent2 = self._tournament_selection(population, fitness_scores, 3)
                 
-                # Cruzamiento
-                child1, child2 = self._crossover(parent1, parent2, containers)
+                child1, child2 = self._pmx_crossover(parent1, parent2)
                 
-                # Mutación
-                if random.random() < 0.1:  # 10% probabilidad de mutación
-                    child1 = self._mutate(child1, containers)
-                if random.random() < 0.1:
-                    child2 = self._mutate(child2, containers)
+                if random.random() < 0.15:
+                    child1 = self._mutate_swap(child1)
+                if random.random() < 0.15:
+                    child2 = self._mutate_swap(child2)
                 
                 new_population.extend([child1, child2])
             
             population = new_population[:population_size]
             
-            if generation % 10 == 0:
+            if generation % 20 == 0:
                 print(f"Generación {generation}: Mejor fitness = {best_fitness:.2f}")
         
-        print(f"Algoritmo genético completado. Mejor fitness: {best_fitness:.2f}")
+        return best_solution if best_solution else list(range(n))
+    
+    def _evaluate_fitness_with_priority(self, individual: List[int], 
+                                       distance_matrix: List[List[float]],
+                                       containers: List[Container]) -> float:
+        """
+        Evalúa fitness considerando distancia Y penalizaciones por prioridad
+        """
+        total_distance = 0.0
+        priority_penalty = 0.0
         
-        if best_solution is None:
-            raise ValueError("No se encontró una solución válida en el algoritmo genético.")
+        # Distancia desde depot al primer contenedor
+        total_distance += distance_matrix[0][individual[0] + 1]
         
-        # Convertir mejor solución a formato de respuesta
-        return self._solution_to_response(best_solution, containers, vehicles, distance_matrix)
+        # Distancias entre contenedores consecutivos
+        for i in range(len(individual) - 1):
+            total_distance += distance_matrix[individual[i] + 1][individual[i + 1] + 1]
+        
+        # Distancia desde último contenedor al depot
+        total_distance += distance_matrix[individual[-1] + 1][0]
+        
+        # Penalización: contenedores de alta prioridad deben estar temprano en la ruta
+        for position, container_idx in enumerate(individual):
+            container = containers[container_idx]
+            
+            if container.is_overflow:
+                # Penalización alta si desbordamiento está tarde en la ruta
+                priority_penalty += position * 2.0
+            elif container.priority >= 2.0:
+                # Penalización media para alta prioridad
+                priority_penalty += position * 0.5
+        
+        return total_distance + priority_penalty
+    
+    def _tournament_selection(self, population: List[List[int]], 
+                             fitness_scores: List[float],
+                             tournament_size: int = 3) -> List[int]:
+        """Selección por torneo"""
+        tournament_indices = random.sample(range(len(population)), min(tournament_size, len(population)))
+        best_idx = min(tournament_indices, key=lambda i: fitness_scores[i])
+        return population[best_idx].copy()
+    
+    def _pmx_crossover(self, parent1: List[int], parent2: List[int]) -> Tuple[List[int], List[int]]:
+        """Partially Mapped Crossover para permutaciones"""
+        size = len(parent1)
+        if size < 2:
+            return parent1.copy(), parent2.copy()
+        
+        # Seleccionar puntos de corte
+        cx_point1 = random.randint(0, size - 1)
+        cx_point2 = random.randint(cx_point1 + 1, size)
+        
+        # Inicializar hijos
+        child1 = [-1] * size
+        child2 = [-1] * size
+        
+        # Copiar segmento medio
+        child1[cx_point1:cx_point2] = parent1[cx_point1:cx_point2]
+        child2[cx_point1:cx_point2] = parent2[cx_point1:cx_point2]
+        
+        # Mapear el resto
+        def fill_child(child, parent_source, parent_target, cx1, cx2):
+            for i in range(size):
+                if i >= cx1 and i < cx2:
+                    continue
+                
+                value = parent_source[i]
+                while value in child[cx1:cx2]:
+                    idx = parent_source.index(value)
+                    value = parent_target[idx]
+                
+                child[i] = value
+        
+        fill_child(child1, parent2, parent1, cx_point1, cx_point2)
+        fill_child(child2, parent1, parent2, cx_point1, cx_point2)
+        
+        return child1, child2
+    
+    def _mutate_swap(self, individual: List[int]) -> List[int]:
+        """Mutación por intercambio de dos elementos"""
+        mutated = individual.copy()
+        if len(mutated) > 1:
+            idx1, idx2 = random.sample(range(len(mutated)), 2)
+            mutated[idx1], mutated[idx2] = mutated[idx2], mutated[idx1]
+        return mutated
+    
+    def get_distance_matrix(self, containers: List[Container]) -> Optional[List[List[float]]]:
+        """Obtiene matriz de distancias usando OpenRouteService Matrix API"""
+        if not self.api_key:
+            return None
+        
+        locations = [[self.depot_lon, self.depot_lat]]
+        locations.extend([[c.lon, c.lat] for c in containers])
+        
+        if len(locations) > self.max_locations:
+            print(f"Demasiadas ubicaciones ({len(locations)}). Límite: {self.max_locations}")
+            return None
+        
+        url = f"{self.base_url}/v2/matrix/driving-car"
+        headers = {
+            'Accept': 'application/json',
+            'Authorization': self.api_key,
+            'Content-Type': 'application/json; charset=utf-8'
+        }
+        body = {
+            "locations": locations,
+            "metrics": ["distance"],
+            "units": "km"
+        }
+        
+        try:
+            response = requests.post(url, json=body, headers=headers, timeout=15)
+            if response.status_code == 200:
+                data = response.json()
+                return data.get('distances')
+            else:
+                print(f"Error OpenRouteService: {response.status_code}")
+                return None
+        except Exception as e:
+            print(f"Error de conexión: {e}")
+            return None
     
     def _create_haversine_matrix(self, containers: List[Container]) -> List[List[float]]:
-        """Crea matriz de distancias usando fórmula Haversine"""
-        n = len(containers) + 1  # +1 para depot
+        """Crea matriz de distancias usando Haversine"""
+        n = len(containers) + 1
         matrix = [[0.0 for _ in range(n)] for _ in range(n)]
         
-        # Distancias desde/hacia depot (índice 0)
         for i, container in enumerate(containers, 1):
             dist = self.calculate_distance(self.depot_lat, self.depot_lon, container.lat, container.lon)
             matrix[0][i] = dist
             matrix[i][0] = dist
         
-        # Distancias entre contenedores
         for i, container1 in enumerate(containers, 1):
             for j, container2 in enumerate(containers, 1):
                 if i != j:
@@ -363,297 +430,54 @@ class RouteOptimizer:
         
         return matrix
     
-    def _initialize_population(self, containers: List[Container], vehicles: List[Vehicle], 
-                             population_size: int) -> List[List[List[int]]]:
-        """Inicializa población para algoritmo genético"""
-        population = []
-        container_indices = list(range(1, len(containers) + 1))  # 1-indexed
-        
-        for _ in range(population_size):
-            # Crear solución aleatoria
-            shuffled_containers = container_indices.copy()
-            random.shuffle(shuffled_containers)
-            
-            # Dividir contenedores entre vehículos
-            individual = [[] for _ in vehicles]
-            containers_per_vehicle = len(shuffled_containers) // len(vehicles)
-            
-            for i, vehicle in enumerate(vehicles):
-                start_idx = i * containers_per_vehicle
-                if i == len(vehicles) - 1:  # Último vehículo toma los restantes
-                    individual[i] = shuffled_containers[start_idx:]
-                else:
-                    individual[i] = shuffled_containers[start_idx:start_idx + containers_per_vehicle]
-            
-            population.append(individual)
-        
-        return population
-    
-    def _evaluate_fitness(self, individual: List[List[int]], distance_matrix: List[List[float]], 
-                         vehicles: List[Vehicle]) -> float:
-        """Evalúa fitness de un individuo (menor es mejor)"""
-        total_distance = 0.0
-        
-        for vehicle_idx, route in enumerate(individual):
-            if not route:
-                continue
-            
-            # Distancia desde depot al primer contenedor
-            total_distance += distance_matrix[0][route[0]]
-            
-            # Distancias entre contenedores consecutivos
-            for i in range(len(route) - 1):
-                total_distance += distance_matrix[route[i]][route[i + 1]]
-            
-            # Distancia desde último contenedor al depot
-            total_distance += distance_matrix[route[-1]][0]
-        
-        return total_distance
-    
-    def _tournament_selection(self, population: List[List[List[int]]], fitness_scores: List[float], 
-                            tournament_size: int = 3) -> List[List[int]]:
-        """Selección por torneo"""
-        tournament_indices = random.sample(range(len(population)), min(tournament_size, len(population)))
-        best_idx = min(tournament_indices, key=lambda i: fitness_scores[i])
-        return population[best_idx].copy()
-    
-    def _crossover(self, parent1: List[List[int]], parent2: List[List[int]], 
-                  containers: List[Container]) -> Tuple[List[List[int]], List[List[int]]]:
-        """Cruzamiento entre dos padres"""
-        # Cruzamiento simple: intercambiar rutas aleatorias
-        child1 = [route.copy() for route in parent1]
-        child2 = [route.copy() for route in parent2]
-        
-        if len(child1) > 1 and len(child2) > 1:
-            # Intercambiar dos rutas aleatorias
-            idx1, idx2 = random.sample(range(len(child1)), 2)
-            child1[idx1], child2[idx1] = child2[idx1].copy(), child1[idx1].copy()
-            child1[idx2], child2[idx2] = child2[idx2].copy(), child1[idx2].copy()
-        
-        return child1, child2
-    
-    def _mutate(self, individual: List[List[int]], containers: List[Container]) -> List[List[int]]:
-        """Mutación de un individuo"""
-        mutated = [route.copy() for route in individual]
-        
-        # Mutación: mover un contenedor aleatorio a otra ruta
-        non_empty_routes = [i for i, route in enumerate(mutated) if route]
-        
-        if len(non_empty_routes) >= 2:
-            # Seleccionar ruta origen y destino
-            source_route_idx = random.choice(non_empty_routes)
-            target_route_idx = random.choice(range(len(mutated)))
-            
-            if mutated[source_route_idx]:
-                # Mover contenedor
-                container_to_move = mutated[source_route_idx].pop(random.randint(0, len(mutated[source_route_idx]) - 1))
-                mutated[target_route_idx].append(container_to_move)
-        
-        return mutated
-    
-    def _solution_to_response(self, solution: List[List[int]], containers: List[Container], 
-                            vehicles: List[Vehicle], distance_matrix: List[List[float]]) -> Dict:
-        """Convierte solución del AG a formato de respuesta"""
-        routes = []
-        total_distance = 0.0
-        
-        for vehicle_idx, route in enumerate(solution):
-            if not route:
-                continue
-            
-            vehicle = vehicles[vehicle_idx]
-            route_distance = 0.0
-            route_containers = []
-            
-            # Calcular distancia de la ruta
-            route_distance += distance_matrix[0][route[0]]  # Depot a primer contenedor
-            
-            for i, container_idx in enumerate(route, 1):
-                container = containers[container_idx - 1]
-                
-                # Distancia desde punto anterior
-                if i == 1:
-                    distance_from_previous = distance_matrix[0][container_idx]
-                else:
-                    distance_from_previous = distance_matrix[route[i-2]][container_idx]
-                
-                route_containers.append({
-                    "container_id": container.id,
-                    "latitude": container.lat,
-                    "longitude": container.lon,
-                    "fill_percentage": container.fill_percentage,
-                    "distance_from_previous": round(distance_from_previous, 2),
-                    "order": i
-                })
-                
-                # Sumar distancia entre contenedores consecutivos
-                if i < len(route):
-                    route_distance += distance_matrix[container_idx][route[i]]
-            
-            # Distancia de regreso al depot
-            route_distance += distance_matrix[route[-1]][0]
-            
-            # Obtener geometría de ruta
-            route_geometry = self.get_route_geometry(containers, route)
-            
-            # Calcular estimaciones
-            estimated_time = int(route_distance * 2.5 + len(route_containers) * 5)
-            fuel_consumption = route_distance * 0.35
-            co2_emissions = fuel_consumption * 2.6
-            
-            route_data = {
-                "route_id": vehicle_idx + 1,
-                "vehicle_id": vehicle.id,
-                "containers": route_containers,
-                "total_distance_km": round(route_distance, 2),
-                "estimated_time_minutes": estimated_time,
-                "fuel_consumption_liters": round(fuel_consumption, 2),
-                "co2_emissions_kg": round(co2_emissions, 2),
-                "depot_location": {"lat": self.depot_lat, "lon": self.depot_lon}
-            }
-            
-            if route_geometry:
-                route_data["route_coordinates"] = route_geometry
-            
-            routes.append(route_data)
-            total_distance += route_distance
-        
-        return {
-            "routes": routes,
-            "total_distance": round(total_distance, 2),
-            "containers_count": len(containers),
-            "optimization_method": "genetic_algorithm_openrouteservice"
-        }
-    
-    def _nearest_neighbor_with_matrix(self, containers: List[Container], 
-                                    distance_matrix: List[List[float]]) -> List[int]:
-        """Algoritmo nearest neighbor usando matriz de distancias real"""
-        n = len(containers)
-        unvisited = list(range(1, n + 1))  # Índices 1 a n (0 es depot)
-        route = []
-        current_pos = 0  # Empezar en depot
-        
-        while unvisited:
-            nearest_idx = None
-            min_distance = float('inf')
-            
-            for container_idx in unvisited:
-                container = containers[container_idx - 1]
-                distance = distance_matrix[current_pos][container_idx]
-                
-                # Aplicar peso de prioridad
-                weighted_distance = distance / container.priority
-                
-                if weighted_distance < min_distance:
-                    min_distance = weighted_distance
-                    nearest_idx = container_idx
-            
-            if nearest_idx:
-                route.append(nearest_idx)
-                current_pos = nearest_idx
-                unvisited.remove(nearest_idx)
-        
-        return route
-    
     def _calculate_route_distance_from_matrix(self, route_order: List[int], 
                                             distance_matrix: List[List[float]]) -> float:
         """Calcula distancia total usando matriz"""
         total_distance = 0.0
-        current_pos = 0  # Depot
+        current_pos = 0
         
         for container_idx in route_order:
-            total_distance += distance_matrix[current_pos][container_idx]
-            current_pos = container_idx
+            total_distance += distance_matrix[current_pos][container_idx + 1]
+            current_pos = container_idx + 1
         
-        # Regreso al depot
         total_distance += distance_matrix[current_pos][0]
         
         return total_distance
     
-    def _nearest_neighbor_haversine(self, containers: List[Container]) -> Tuple[List[int], float]:
-        """Fallback usando distancias Haversine"""
-        unvisited = containers.copy()
-        route_order = []
-        total_distance = 0.0
-        current_lat, current_lon = self.depot_lat, self.depot_lon
+    def get_route_geometry(self, containers: List[Container], route_order: List[int]) -> Optional[List[List[float]]]:
+        """Obtiene geometría de ruta real"""
+        if not self.api_key:
+            return None
         
-        while unvisited:
-            nearest_container = None
-            nearest_idx = None
-            min_distance = float('inf')
+        coords = [[self.depot_lon, self.depot_lat]]
+        
+        for idx in route_order:
+            c = containers[idx]
+            coords.append([c.lon, c.lat])
+        
+        coords.append([self.depot_lon, self.depot_lat])
+        
+        url = "https://api.openrouteservice.org/v2/directions/driving-car/geojson"
+        headers = {
+            "Authorization": self.api_key,
+            "Content-Type": "application/json"
+        }
+        body = {
+            "coordinates": coords,
+            "geometry": True,
+            "instructions": False,
+        }
+        
+        try:
+            resp = requests.post(url, json=body, headers=headers, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
             
-            for i, container in enumerate(unvisited):
-                distance = self.calculate_distance(current_lat, current_lon, container.lat, container.lon)
-                weighted_distance = distance / container.priority
-                
-                if weighted_distance < min_distance:
-                    min_distance = weighted_distance
-                    nearest_container = container
-                    nearest_idx = i
-            
-            if nearest_container:
-                actual_distance = self.calculate_distance(current_lat, current_lon, 
-                                                        nearest_container.lat, nearest_container.lon)
-                total_distance += actual_distance
-                
-                # Encontrar índice original
-                original_idx = containers.index(nearest_container) + 1
-                route_order.append(original_idx)
-                
-                current_lat, current_lon = nearest_container.lat, nearest_container.lon
-                unvisited.remove(nearest_container)
-        
-        # Regreso al depot
-        if route_order:
-            last_container = containers[route_order[-1] - 1]
-            return_distance = self.calculate_distance(last_container.lat, last_container.lon, 
-                                                    self.depot_lat, self.depot_lon)
-            total_distance += return_distance
-        
-        return route_order, total_distance
-
-
-# Función para integrar con tu código existente
-def create_openrouteservice_optimizer() -> Optional[RouteOptimizer]:
-    """Factory function para crear optimizador"""
-    try:
-        return RouteOptimizer()
-    except Exception as e:
-        print(f"Error al crear optimizador OpenRouteService: {e}")
-        return None
-
-
-# Ejemplo de uso y pruebas
-if __name__ == "__main__":
-    # Ejemplo de contenedores en Las Condes
-    containers = [
-        Container(1, -33.4100, -70.5200, 85.0, 1.0),
-        Container(2, -33.4150, -70.5250, 92.0, 1.5),
-        Container(3, -33.4080, -70.5180, 78.0, 1.0),
-        Container(4, -33.4200, -70.5300, 88.0, 1.2),
-        Container(5, -33.4050, -70.5150, 95.0, 1.8),
-    ]
-    
-    # Crear vehículos
-    vehicles = [
-        Vehicle("TRUCK-001", 5000.0, -33.4119, -70.5241),
-        Vehicle("TRUCK-002", 3000.0, -33.4119, -70.5241)
-    ]
-    
-    # Crear optimizador
-    optimizer = create_openrouteservice_optimizer()
-    
-    if optimizer:
-        print("=== Prueba de Optimización Básica ===")
-        result = optimizer.optimize_route(containers)
-        print(json.dumps(result, indent=2))
-        
-        print("\n=== Prueba de Algoritmo Genético ===")
-        ga_result = optimizer.genetic_algorithm_vrp(containers, vehicles, population_size=20, generations=30)
-        print(json.dumps(ga_result, indent=2))
-        
-        print(f"\n=== Estado del Servicio ===")
-        print(f"API Key configurada: {bool(optimizer.api_key)}")
-        print(f"OpenRouteService disponible: {optimizer.is_openrouteservice_available()}")
-    else:
-        print("No se pudo crear el optimizador. Verifica la configuración.")
+            if "features" in data and len(data["features"]) > 0:
+                feat = data["features"][0]["geometry"]
+                if feat["type"] == "LineString":
+                    return feat["coordinates"]
+            return None
+        except Exception as e:
+            print(f"Error al obtener geometría: {e}")
+            return None
